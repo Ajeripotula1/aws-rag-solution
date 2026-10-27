@@ -1,0 +1,40 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and local config (keep .env.example committed)
+.env
+.env.*
+!.env.example
+
+# Test, lint, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# CDK (Day 2+)
+cdk.out/
+.cdk.staging/
+cdk.context.json
+node_modules/
+
+# Local AWS artifacts
+.aws-sam/
+*.pem
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Scratch files
+*.log
+tmp/

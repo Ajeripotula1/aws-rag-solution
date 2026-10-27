@@ -1,0 +1,20 @@
+[project]
+name = "aws-rag-solution"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "boto3>=1.43.119",
+    "botocore[crt]>=1.43.119",
+    "pytest>=9.1.1",
+    "python-dotenv>=1.2.4",
+    "ruff>=0.17.3",
+]
+
+[project.scripts]
+aws-rag-solution = "aws_rag_solution:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
