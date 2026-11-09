@@ -26,9 +26,31 @@ cdk.out/
 cdk.context.json
 node_modules/
 
-# Local AWS artifacts
+# Local AWS artifacts and build bundles
 .aws-sam/
+samconfig.toml
+*.zip
+
+# Keys, certificates, and credential files
 *.pem
+*.key
+*.p12
+*.pfx
+.aws/
+credentials.json
+secrets.json
+
+# AgentCore CLI local files (each project's agentcore/.gitignore also covers these)
+.env.local
+**/agentcore/.cli/traces/
+**/agentcore/.cli/logs/
+**/agentcore/.cli/migrate/
+
+# Claude Code per-user settings (shared .claude/settings.json stays committed)
+.claude/settings.local.json
+
+# Type-checker caches
+.mypy_cache/
 
 # Editors and OS
 .vscode/
