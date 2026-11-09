@@ -1,6 +1,7 @@
 from typing import Any
+from dataclasses import dataclass
 from collections import OrderedDict
-from strands import Agent, tool
+from strands import Agent, ToolContext, tool
 from strands.models import BedrockModel
 import asyncio
 from strands.agent.conversation_manager.null_conversation_manager import (
@@ -43,12 +44,16 @@ tools.append(add_numbers)
 # Agents-as-tools: each specialist is one build_*_agent() function that holds its prompt and tools
 # and returns an Agent with a name and description. Strands wraps an Agent passed in `tools` as a
 # tool automatically; the description is what the orchestrator reads to decide when to route to it.
-# Request-scoped values (e.g. customer_id) go in as builder arguments, so tools use them directly
-# and the model never supplies them. Keep business logic at module level; tools stay thin wrappers.
+# Request-scoped values (e.g. customer_id) go in as builder arguments and are stored in the agent's
+# `state` at construction. Tools declared with @tool(context=True) read them from
+# tool_context.agent.state, so the model never sees or supplies them.
+# State must be set at construction: when the orchestrator wraps a sub-agent it snapshots its state,
+# and resets the sub-agent to that snapshot before every call.
+# Keep business logic at module level; tools stay thin wrappers.
 
 
 ## FAQ/RAG Agent
-def build_faq_agent() -> Agent:
+def build_faq_agent(customer_id: str) -> Agent:
     system_prompt = """You are an FAQ research agent.
     Always call search_faqs before answering, and answer only from what it returns.
     If the FAQs don't cover the question, say so plainly instead of guessing."""
@@ -57,22 +62,18 @@ def build_faq_agent() -> Agent:
         model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.1
     )
 
-    # @tool(context=True)
-    @tool
-    def search_faqs(query:str, customer_id:str) -> str:
+    @tool(context=True)
+    def search_faqs(query: str, tool_context: ToolContext) -> str:
         """Search the FAQ knowledge base and return the most relevant Q&A entries.
 
         Args:
             query: A short search query describing what the customer is asking about.
         """
-        
-        # customer_id = tool_context.agent.state.get('customer_id')
-        
+        customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
-            return "Unable to retrieve order information: Customer ID not available"
-        print("CUSTOMER ID", customer_id)
+            return "Unable to search FAQs: customer ID not available"
         results = faq_source.retrieve(query)
-        log.info(f"search_faqs query={query!r} hits={len(results)}")
+        log.info(f"search_faqs customer_id={customer_id} query={query!r} hits={len(results)}")
         if not results:
             return "No relevant FAQ entries found."
         return "\n\n".join(f"[{r['source']['category']}]\n{r['text']}" for r in results)
@@ -87,73 +88,72 @@ def build_faq_agent() -> Agent:
         model=model,
         system_prompt=system_prompt,
         tools=[search_faqs],
+        state={"customer_id": customer_id},
         callback_handler=None,  # don't stream sub-agent output to stdout; the orchestrator relays the answer
     )
 
 
 ### Account Agent: only reads information from customer or order table to gather context for other agents
-def build_account_agent() -> Agent:
-    system_prompt = """You are an Account Lookup  agent.
-        Your only job is to lookup information from the table required for the task.
-        You will return your findings in a clean and organized dictionary with no other 
-        stray charcters or messages. If the infromation can not be found in the table, 
-        or the entry does not exist, return empty dict
-        DO NOT MAKE UP YOUR OWN DATA."""
+def build_account_agent(customer_id: str) -> Agent:
+    system_prompt = """You are an Account Lookup agent for the signed-in customer.
+        Your tools already know who the customer is; never ask for a customer ID.
+        Use lookup_customer for profile details (name, tier), lookup_all_orders for their orders,
+        and lookup_single_order when a specific order_id is given.
+        Return only the information requested, as a clean dictionary with no extra text.
+        If nothing is found, return an empty dict. DO NOT MAKE UP YOUR OWN DATA."""
 
     model = BedrockModel(
         model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.1
     )
 
     @tool(context=True)
-    def lookup_customer(tool_context) -> str:
-        """lookup customer information by customer_id and return infromation"""
-        customer_id = tool_context.agent.state.get('customer_id')
-        print("CUSTOMER ID", customer_id)
+    def lookup_customer(tool_context: ToolContext) -> dict:
+        """Look up the current customer's profile."""
+        customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
-            return "Unable to retrieve order information: Customer ID not available"
-        
-        match = next(
+            return {}
+        return next(
+            (c for c in CUSTOMER_TABLE if c.get("customer_id") == customer_id), {}
+        )
+
+    @tool(context=True)
+    def lookup_all_orders(tool_context: ToolContext) -> list:
+        """Look up all orders for the current customer."""
+        customer_id = tool_context.agent.state.get("customer_id")
+        if not customer_id:
+            return []
+        return [o for o in ORDER_TABLE if o.get("customer_id") == customer_id]
+
+    @tool(context=True)
+    def lookup_single_order(order_id: str, tool_context: ToolContext) -> dict:
+        """Look up a single order by order_id. Only returns orders that belong to the current customer.
+
+        Args:
+            order_id: The order ID to look up.
+        """
+        customer_id = tool_context.agent.state.get("customer_id")
+        if not customer_id:
+            return {}
+        return next(
             (
-                customer
-                for customer in CUSTOMER_TABLE
-                if customer.get("customer_id") == customer_id
+                o
+                for o in ORDER_TABLE
+                if o.get("order_id") == order_id and o.get("customer_id") == customer_id
             ),
-            None,
+            {},
         )
-        if match:
-            return match
-        return {}
-
-    @tool
-    def lookup_all_orders(customer_id: str) -> str:
-        """lookup all orders for a customer"""
-        matches = [
-            order for order in ORDER_TABLE if order.get("customer_id") == customer_id
-        ]
-        if matches:
-            return matches
-        return []
-
-    @tool
-    def lookup_single_order(order_id: str) -> str:
-        """serach for a single order"""
-        match = next(
-            (order for order in ORDER_TABLE if order.get("order_id") == order_id), None
-        )
-        if match:
-            return match
-        return {}
 
     return Agent(
-        name="faq_agent",
+        name="account_agent",
         description=(
-            "Answer customer questions about account & login, billing & payments, shipping, orders, "
-            "returns and refunds, using the company FAQ knowledge base. "
-            "Pass the customer's question, rephrased to be self-contained."
+            "Look up the signed-in customer's profile (name, tier) and their orders (all orders, or one "
+            "order by order_id). It already knows who the customer is; no ID is needed. "
+            "Pass a short description of what information is needed."
         ),
         model=model,
         system_prompt=system_prompt,
         tools=[lookup_customer, lookup_all_orders, lookup_single_order],
+        state={"customer_id": customer_id},
         callback_handler=None,  # don't stream sub-agent output to stdout; the orchestrator relays the answer
     )
 
@@ -162,7 +162,11 @@ def build_account_agent() -> Agent:
 def build_orchestrator_agent(specialists: list[Agent]) -> Agent:
     system_prompt = """You are an orchestrator agent with access to specialist agents exposed as tools.
     Route each question to the right specialist and turn its answer into a friendly final reply.
-    Don't answer questions a specialist covers from your own knowledge."""
+    Don't answer questions a specialist covers from your own knowledge.
+
+    The customer is already signed in. The specialists already know who the customer is, so
+    questions about "my account", "my tier", "my orders" etc. can be answered by calling them directly.
+    Never ask the customer for their customer ID, name, or account details to identify them."""
 
     model = BedrockModel(
         model_id=config.ORCHESTRATOR_MODEL_ID, region_name=config.AWS_REGION
@@ -174,6 +178,7 @@ def build_orchestrator_agent(specialists: list[Agent]) -> Agent:
         tools=specialists,
     )
 
+@dataclass(frozen=True)
 class RequestContext:
     """Per-request values that come from the caller, not the model. Tools read these; the model never sees them."""
 
@@ -195,28 +200,20 @@ async def invoke(payload, context):
     prompt = payload.get("prompt")
     customer_id = request_context.customer_id
     session_id = request_context.session_id
-    # prompt = payload.get("prompt")
-    # customer_id = payload.get("customer_id")
-    if not isinstance(prompt, str) or not prompt.strip() or not customer_id:
+    if not isinstance(prompt, str) or not prompt.strip():
         return {"error": "prompt must be a non-empty string"}
-    log.info("Invoking agent")
+    if not customer_id:
+        return {"error": "customer_id is required"}
+    log.info(f"Invoking Orchestrator agent session_id={session_id}")
 
-    # Build fresh agents per request; pass request-scoped values (e.g. customer_id) into the builders that need them
+    # Build fresh agents per request. customer_id goes into each sub-agent's state at construction,
+    # before the orchestrator wraps them (it snapshots sub-agent state at wrap time).
     orchestrator = build_orchestrator_agent(
         [
-            build_faq_agent(),
-            # build_account_agent(),
+            build_faq_agent(customer_id),
+            build_account_agent(customer_id),
         ]
     )
-    # set state for tool context
-    # Store session_id, customer_id, and customer_name in agent state for tools to access
-    
-    # orchestrator.state.set("session_id", session_id)
-    # orchestrator.state.set("customer_id", customer_id)
-    
-    # orchestrator.state.set("jwt_token", jwt_token)
-    # if customer_name:
-        # supervisor.state.set("customer_name", customer_name)
     result = await orchestrator.invoke_async(prompt)
 
     # Whatever is returned here is serialized as the JSON response body
