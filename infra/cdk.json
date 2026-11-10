@@ -1,0 +1,10 @@
+{
+  "app": "uv run python app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["README.md", "cdk*.json", "**/__pycache__", ".venv", "scripts"]
+  },
+  "context": {
+    "@aws-cdk/aws-iam:minimizePolicies": true
+  }
+}
