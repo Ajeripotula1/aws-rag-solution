@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "agents",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "agents"
+  },
+  "runtimes": [
+    {
+      "name": "agents",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/agents/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "envVars": [
+        { "name": "ORCHESTRATOR_MODEL_ID", "value": "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
+        { "name": "WORKER_MODEL_ID", "value": "us.anthropic.claude-sonnet-4-5-20250929-v1:0" }
+      ]
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "capacityProviders": [],
+  "payments": []
+}
