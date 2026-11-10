@@ -12,7 +12,7 @@ import config
 import faq_source
 from model.load import load_model
 from mcp_client.client import get_streamable_http_mcp_client
-from test_data import CUSTOMER_TABLE, ORDER_TABLE
+import orders_repo
 
 app = BedrockAgentCoreApp()
 log = app.logger
@@ -112,9 +112,7 @@ def build_account_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return {}
-        return next(
-            (c for c in CUSTOMER_TABLE if c.get("customer_id") == customer_id), {}
-        )
+        return orders_repo.get_customer(customer_id) or {}
 
     @tool(context=True)
     def lookup_all_orders(tool_context: ToolContext) -> list:
@@ -122,7 +120,7 @@ def build_account_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return []
-        return [o for o in ORDER_TABLE if o.get("customer_id") == customer_id]
+        return orders_repo.list_orders(customer_id)
 
     @tool(context=True)
     def lookup_single_order(order_id: str, tool_context: ToolContext) -> dict:
@@ -134,14 +132,7 @@ def build_account_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return {}
-        return next(
-            (
-                o
-                for o in ORDER_TABLE
-                if o.get("order_id") == order_id and o.get("customer_id") == customer_id
-            ),
-            {},
-        )
+        return orders_repo.get_order(customer_id, order_id) or {}
 
     return Agent(
         name="account_agent",
@@ -158,6 +149,102 @@ def build_account_agent(customer_id: str) -> Agent:
     )
 
 
+### Refund Agent: checks eligibility and processes refunds for the signed-in customer's orders.
+# The eligibility rules live in orders_repo (code), not in the prompt. process_refund re-runs every
+# check itself, so a refund can't go through even if the model skips check_refund or is given a wrong order_id.
+def build_refund_agent(customer_id: str) -> Agent:
+    system_prompt = f"""You are a Refund agent for the signed-in customer.
+        Your tools already know who the customer is; never ask for a customer ID.
+
+        1. Identify the order. If you're given an order_id, use it. Otherwise call list_my_orders and
+           match the item the customer describes. If more than one order matches, or none do,
+           don't guess: say which orders could match and stop.
+        2. Call check_refund on that order.
+        3. Only if the request explicitly asks to refund the order AND check_refund says it is eligible,
+           call process_refund. If the request only asks whether an order is eligible, don't process it.
+        4. Report the outcome plainly: what was refunded, or why it can't be.
+
+        Refund policy: delivered orders can be refunded within {orders_repo.REFUND_WINDOW.days} days of delivery,
+        for a full refund minus shipping costs. Never promise a refund that process_refund did not confirm."""
+
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.1
+    )
+
+    @tool(context=True)
+    def list_my_orders(tool_context: ToolContext) -> list:
+        """List the current customer's orders, to find the order_id for an item they describe."""
+        customer_id = tool_context.agent.state.get("customer_id")
+        if not customer_id:
+            return []
+        return orders_repo.list_orders(customer_id)
+
+    @tool(context=True)
+    def check_refund(order_id: str, tool_context: ToolContext) -> dict:
+        """Check whether one of the current customer's orders can be refunded. Changes nothing.
+
+        Args:
+            order_id: The order to check.
+        """
+        customer_id = tool_context.agent.state.get("customer_id")
+        if not customer_id:
+            return {"eligible": False, "reason": "Customer not identified."}
+        order = orders_repo.get_order(customer_id, order_id)
+        reason = orders_repo.refund_ineligibility_reason(order)
+        return {"eligible": reason is None, "reason": reason, "order": order}
+
+    @tool(context=True)
+    def process_refund(order_id: str, reason: str, tool_context: ToolContext) -> dict:
+        """Refund one of the current customer's delivered orders and mark it refunded.
+        Re-checks eligibility itself; refuses if the order isn't eligible.
+
+        Args:
+            order_id: The order to refund.
+            reason: The customer's reason for the refund, in their words.
+        """
+        customer_id = tool_context.agent.state.get("customer_id")
+        if not customer_id:
+            return {"refunded": False, "reason": "Customer not identified."}
+
+        order = orders_repo.get_order(customer_id, order_id)
+        why_not = orders_repo.refund_ineligibility_reason(order)
+        if why_not is None and not orders_repo.mark_refunded(customer_id, order_id):
+            why_not = "Order status changed before the refund could be processed."  # lost a race
+        if why_not:
+            log.info(f"refund_rejected customer_id={customer_id} order_id={order_id} why={why_not!r}")
+            orders_repo.append_event(
+                customer_id, "refund_rejected", order_id=order_id, reason=reason, rejection=why_not
+            )
+            return {"refunded": False, "reason": why_not}
+
+        log.info(f"refund_processed customer_id={customer_id} order_id={order_id}")
+        orders_repo.append_event(
+            customer_id,
+            "refund_processed",
+            order_id=order_id,
+            item=order["item"],
+            reason=reason,
+            prev_status="delivered",
+            new_status="refunded",
+        )
+        return {"refunded": True, "order_id": order_id, "item": order["item"]}
+
+    return Agent(
+        name="refund_agent",
+        description=(
+            "Check refund eligibility for, and process refunds of, the signed-in customer's orders. "
+            "It already knows who the customer is and can find the order from an item description. "
+            "Pass the item or order_id, whether the customer wants the refund processed or only an "
+            "eligibility check, and the customer's reason if given."
+        ),
+        model=model,
+        system_prompt=system_prompt,
+        tools=[list_my_orders, check_refund, process_refund],
+        state={"customer_id": customer_id},
+        callback_handler=None,
+    )
+
+
 ### Orchestrator Agent
 def build_orchestrator_agent(specialists: list[Agent]) -> Agent:
     system_prompt = """You are an orchestrator agent with access to specialist agents exposed as tools.
@@ -166,7 +253,16 @@ def build_orchestrator_agent(specialists: list[Agent]) -> Agent:
 
     The customer is already signed in. The specialists already know who the customer is, so
     questions about "my account", "my tier", "my orders" etc. can be answered by calling them directly.
-    Never ask the customer for their customer ID, name, or account details to identify them."""
+    Never ask the customer for their customer ID, name, or account details to identify them.
+
+    Refunds: always call refund_agent for anything about refunds. It finds the order from an item
+    description itself, so never ask the customer for an order ID or order details first.
+    - A direct request such as "refund my X", "please refund X" or "I want a refund for X" is an explicit
+      request: tell refund_agent to PROCESS the refund. Don't ask the customer to confirm first.
+    - A question such as "can I refund X?" or "is X eligible?" is not a request: tell refund_agent to
+      only CHECK eligibility.
+    Pass the item or order_id and the customer's reason, if given. Relay refund_agent's outcome exactly;
+    never say a refund was processed unless refund_agent confirmed it."""
 
     model = BedrockModel(
         model_id=config.ORCHESTRATOR_MODEL_ID, region_name=config.AWS_REGION
@@ -212,6 +308,7 @@ async def invoke(payload, context):
         [
             build_faq_agent(customer_id),
             build_account_agent(customer_id),
+            build_refund_agent(customer_id),
         ]
     )
     result = await orchestrator.invoke_async(prompt)

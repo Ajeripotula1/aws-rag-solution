@@ -67,6 +67,7 @@ CUSTOMER_TABLE = [
 # PK: customer_id (S), SK: order_id (S).
 # Access patterns: list a customer's orders (Query on PK), get one order (PK + SK).
 # status is one of: placed, delivering, delivered, refunded
+# delivered_at is set once status reaches delivered; the 30-day refund window counts from it.
 ORDER_TABLE = [
     {
         "customer_id": "C001",
@@ -74,6 +75,7 @@ ORDER_TABLE = [
         "item": "iPhone 16 Pro Max",
         "status": "delivered",
         "created_at": "2026-10-20T14:03:00Z",
+        "delivered_at": "2026-10-23T16:40:00Z",
     },
     {
         "customer_id": "C002",
@@ -81,6 +83,7 @@ ORDER_TABLE = [
         "item": "Samsung Galaxy 9",
         "status": "delivered",
         "created_at": "2026-11-03T09:15:00Z",
+        "delivered_at": "2026-11-06T11:20:00Z",
     },
     {
         "customer_id": "C001",
@@ -96,19 +99,17 @@ ORDER_TABLE = [
         "status": "placed",
         "created_at": "2026-11-03T09:15:00Z",
     },
-]
-
-# Test Agent State Table
-# PK: session_id (S), SK: created_at (S, ISO 8601 so it sorts by time).
-# Access pattern: load a session's history in order (Query on PK).
-# expires_at (N, epoch seconds) is the DynamoDB TTL attribute.
-STATE_TABLE = [
     {
-        "session_id": "S001",
-        "created_at": "2026-11-04T10:00:00Z",
         "customer_id": "C001",
-        "role": "user",
-        "content": "Where is my android order?",
-        "expires_at": 1794045600,
+        "order_id": "O005",
+        "item": "AirPods Pro",
+        "status": "delivered",
+        "created_at": "2026-08-01T10:00:00Z",
+        "delivered_at": "2026-08-04T15:00:00Z",  # outside the 30-day refund window
     },
 ]
+
+# Test Events Table (append-only audit log, written by tools only, never by the model)
+# PK: customer_id (S), SK: created_at#event_id (S, sorts by time).
+# Access pattern: a customer's history of actions (Query on PK).
+EVENTS_TABLE = []
