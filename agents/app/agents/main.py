@@ -3,18 +3,25 @@ from dataclasses import dataclass
 
 import boto3
 import config
-import faq_source
-import orders_repo
+from datetime import timedelta
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from botocore.exceptions import ClientError
 from mcp_client.client import get_streamable_http_mcp_client
 from strands import Agent, ToolContext, tool
 from strands.models import BedrockModel
 
 app = BedrockAgentCoreApp()
 log = app.logger
+
+REFUND_WINDOW = timedelta(days=30)
+
+# FAQ passages scoring below this are dropped. Measured 2026-11-12 (S3 Vectors KB, top 3 results):
+# the matching FAQ scored 0.44-0.66, while off-topic queries and the other results all scored
+# 0.34-0.40. Re-measure if the documents, chunking or embedding model change.
+MIN_SCORE = 0.42
+bedrock_client = boto3.client("bedrock-agent-runtime", region_name=config.AWS_REGION)
 # lambda client
 lambda_client = boto3.client("lambda", region_name=config.AWS_REGION)
-
 # Define a Streamable HTTP MCP Client
 mcp_clients = [get_streamable_http_mcp_client()]
 
@@ -30,6 +37,31 @@ def call_orders_lambda(tool: str, **arguments) -> dict:
         return {"error": "Order service failed, try again later"}
     return json.loads(response["Payload"].read())
 
+# Query and retrieve relevant data from Knowledge base
+def retrieve(query: str, top_k: int = 3) -> tuple[list[dict], list[float]]:
+    """Return (passages scoring >= MIN_SCORE, every raw score) for a text query.
+
+    Each passage is {"text": str, "source": str | None, "score": float}.
+    The raw scores are returned for logging, so MIN_SCORE can be tuned.
+    """
+    response = bedrock_client.retrieve(
+        knowledgeBaseId=config.KB_ID,
+        retrievalQuery={"text": query},
+        retrievalConfiguration={
+            "vectorSearchConfiguration": {"numberOfResults": top_k}
+        },
+    )
+    results = response["retrievalResults"]
+    passages = [
+        {
+            "text": r["content"]["text"],
+            "source": r.get("location", {}).get("s3Location", {}).get("uri"),
+            "score": r.get("score", 0.0),
+        }
+        for r in results
+        if r.get("score", 0.0) >= MIN_SCORE
+    ]
+    return passages, [r.get("score", 0.0) for r in results]
 
 # Agents-as-tools: each specialist is one build_*_agent() function that holds its prompt and tools
 # and returns an Agent with a name and description. Strands wraps an Agent passed in `tools` as a
@@ -42,11 +74,26 @@ def call_orders_lambda(tool: str, **arguments) -> dict:
 # Keep business logic at module level; tools stay thin wrappers.
 
 
-## FAQ/RAG Agent
+## FAQ/RAG Agent: answers general policy and how-to questions from the Bedrock Knowledge Base.
 def build_faq_agent(customer_id: str) -> Agent:
-    system_prompt = """You are an FAQ research agent.
-    Always call search_faqs before answering, and answer only from what it returns.
-    If the FAQs don't cover the question, say so plainly instead of guessing."""
+    system_prompt = """You are an FAQ research agent. You answer general questions about company
+        policies and how-to steps, using only the FAQ knowledge base.
+
+        1. Always call search_faqs before answering. Use a short query with the key terms of the question.
+           If the question has several parts (e.g. shipping cost and return window), search each part.
+        2. If the results don't address the question, try once more with a rephrased query
+           (synonyms, or the policy area, e.g. "restocking fee electronics" or "loyalty points expire").
+        3. Answer only from the returned passages. A passage can cover several FAQs; use only the
+           ones that answer the question and ignore the rest.
+        4. Quote amounts, percentages, time windows, phone numbers, addresses and names exactly as
+           written. Never round, convert or estimate them.
+        5. If the FAQs don't cover the question, or only part of it, say which part isn't covered.
+           Don't fill gaps from general knowledge.
+        6. Keep it short: the direct answer first, then any conditions or exceptions that apply.
+           Don't mention relevance scores, search queries or the knowledge base itself.
+
+        You can't see the customer's account or orders. If the answer depends on them
+        (e.g. whether their order can still be returned), give the general policy and say so."""
 
     model = BedrockModel(
         model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.1
@@ -54,27 +101,40 @@ def build_faq_agent(customer_id: str) -> Agent:
 
     @tool(context=True)
     def search_faqs(query: str, tool_context: ToolContext) -> str:
-        """Search the FAQ knowledge base and return the most relevant Q&A entries.
+        """Search the FAQ knowledge base and return the most relevant FAQ passages.
 
         Args:
-            query: A short search query describing what the customer is asking about.
+            query: A short search query with the key terms of what the customer is asking about.
         """
+        # FAQs aren't customer-specific; customer_id is only logged.
         customer_id = tool_context.agent.state.get("customer_id")
-        if not customer_id:
-            return "Unable to search FAQs: customer ID not available"
-        results = faq_source.retrieve(query)
+        try:
+            passages, scores = retrieve(query)
+        except ClientError as e:
+            log.error(f"search_faqs retrieve failed query={query!r}: {e}")
+            return "FAQ search is unavailable right now."
+
         log.info(
-            f"search_faqs customer_id={customer_id} query={query!r} hits={len(results)}"
+            f"search_faqs customer_id={customer_id} query={query!r} "
+            f"scores={[round(s, 3) for s in scores]} kept={len(passages)}"
         )
-        if not results:
+        if not passages:
             return "No relevant FAQ entries found."
-        return "\n\n".join(f"[{r['source']['category']}]\n{r['text']}" for r in results)
+        return "\n\n".join(
+            f"[relevance {p['score']:.2f}]\n{p['text']}" for p in passages
+        )
 
     return Agent(
         name="faq_agent",
         description=(
-            "Answer customer questions about account & login, billing & payments, shipping, orders, "
-            "returns and refunds, using the company FAQ knowledge base. "
+            "Answer general policy and how-to questions from the company FAQ knowledge base: "
+            "account & login (password reset, 2FA, lockouts, account deletion), billing & payments "
+            "(payment methods, charges, invoices, installments, gift cards, price matching), "
+            "shipping & orders (costs, delivery times, international, tracking, changes, missing "
+            "packages), returns & refunds policy (return window, refund timing, restocking fees, "
+            "non-returnable items, damaged items), warranty and extended protection plans, the loyalty "
+            "program and tiers, discounts and promo codes, and how to contact support (hours, phone, "
+            "email, returns address). It can't see the customer's account or orders. "
             "Pass the customer's question, rephrased to be self-contained."
         ),
         model=model,
@@ -163,7 +223,7 @@ def build_refund_agent(customer_id: str) -> Agent:
            call process_refund. If the request only asks whether an order is eligible, don't process it.
         4. Report the outcome plainly: what was refunded, or why it can't be.
 
-        Refund policy: delivered orders can be refunded within {orders_repo.REFUND_WINDOW.days} days of delivery,
+        Refund policy: delivered orders can be refunded within {REFUND_WINDOW.days} days of delivery,
         for a full refund minus shipping costs. Never promise a refund that process_refund did not confirm."""
 
     model = BedrockModel(
@@ -236,6 +296,15 @@ def build_orchestrator_agent(specialists: list[Agent]) -> Agent:
     The customer is already signed in. The specialists already know who the customer is, so
     questions about "my account", "my tier", "my orders" etc. can be answered by calling them directly.
     Never ask the customer for their customer ID, name, or account details to identify them.
+
+    General questions: send questions about company policies, fees, shipping, payments, warranty,
+    loyalty, discounts, account how-tos and support contact details to faq_agent, even if they seem
+    like common knowledge; this company's policies may differ. If a question needs both the policy and
+    the customer's own data (e.g. "how many loyalty points do I need for $5 off, and what's my tier?"),
+    call faq_agent for the policy and account_agent for their data, then combine the answers.
+    Relay faq_agent's facts (amounts, time windows, phone numbers) exactly; don't add details it didn't
+    give. If it says the FAQs don't cover something, tell the customer and don't answer from your own
+    knowledge.
 
     Refunds: always call refund_agent for anything about refunds. It finds the order from an item
     description itself, so never ask the customer for an order ID or order details first.

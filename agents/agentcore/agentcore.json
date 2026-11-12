@@ -21,7 +21,15 @@
         },
         {
           "name": "WORKER_MODEL_ID",
-          "value": "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+          "value": "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        },
+        {
+          "name": "ORDERS_LAMBDA_NAME",
+          "value": "aws-rag-solution-orders"
+        },
+        {
+          "name": "KB_ID",
+          "value": "SCFYIOZDOU"
         }
       ],
       "networkMode": "PUBLIC",
