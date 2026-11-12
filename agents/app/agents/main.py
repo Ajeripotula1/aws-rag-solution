@@ -1,45 +1,35 @@
-from typing import Any
+import json
 from dataclasses import dataclass
-from collections import OrderedDict
-from strands import Agent, ToolContext, tool
-from strands.models import BedrockModel
-import asyncio
-from strands.agent.conversation_manager.null_conversation_manager import (
-    NullConversationManager,
-)
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+
+import boto3
 import config
 import faq_source
-from model.load import load_model
-from mcp_client.client import get_streamable_http_mcp_client
 import orders_repo
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from mcp_client.client import get_streamable_http_mcp_client
+from strands import Agent, ToolContext, tool
+from strands.models import BedrockModel
 
 app = BedrockAgentCoreApp()
 log = app.logger
+# lambda client
+lambda_client = boto3.client("lambda", region_name=config.AWS_REGION)
+
 # Define a Streamable HTTP MCP Client
 mcp_clients = [get_streamable_http_mcp_client()]
 
 
-# Define a collection of tools used by the model
-tools = []
+# generic Lambda caller
+def call_orders_lambda(tool: str, **arguments) -> dict:
+    response = lambda_client.invoke(
+        FunctionName=config.ORDERS_LAMBDA_NAME,
+        Payload=json.dumps({"tool": tool, "arguments": arguments}),
+    )
+    if "FunctionError" in response:
+        log.error(f"orders lambda {tool} failed: {response['Payload'].read()!r}")
+        return {"error": "Order service failed, try again later"}
+    return json.loads(response["Payload"].read())
 
-_INLINE_FUNCTION_NAMES = set()
-
-
-# Define a simple function tool
-@tool
-def add_numbers(a: int, b: int) -> int:
-    """Return the sum of two numbers"""
-    return a + b
-
-
-tools.append(add_numbers)
-
-
-# # Add MCP client to tools if available
-# for mcp_client in mcp_clients:
-#     if mcp_client:
-#         tools.append(mcp_client)
 
 # Agents-as-tools: each specialist is one build_*_agent() function that holds its prompt and tools
 # and returns an Agent with a name and description. Strands wraps an Agent passed in `tools` as a
@@ -73,7 +63,9 @@ def build_faq_agent(customer_id: str) -> Agent:
         if not customer_id:
             return "Unable to search FAQs: customer ID not available"
         results = faq_source.retrieve(query)
-        log.info(f"search_faqs customer_id={customer_id} query={query!r} hits={len(results)}")
+        log.info(
+            f"search_faqs customer_id={customer_id} query={query!r} hits={len(results)}"
+        )
         if not results:
             return "No relevant FAQ entries found."
         return "\n\n".join(f"[{r['source']['category']}]\n{r['text']}" for r in results)
@@ -112,7 +104,9 @@ def build_account_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return {}
-        return orders_repo.get_customer(customer_id) or {}
+        return call_orders_lambda("get_customer", customer_id=customer_id).get(
+            "customer", {}
+        )
 
     @tool(context=True)
     def lookup_all_orders(tool_context: ToolContext) -> list:
@@ -120,7 +114,9 @@ def build_account_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return []
-        return orders_repo.list_orders(customer_id)
+        return call_orders_lambda("list_orders", customer_id=customer_id).get(
+            "orders", []
+        )
 
     @tool(context=True)
     def lookup_single_order(order_id: str, tool_context: ToolContext) -> dict:
@@ -132,7 +128,10 @@ def build_account_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return {}
-        return orders_repo.get_order(customer_id, order_id) or {}
+        result = call_orders_lambda(
+            "get_order", customer_id=customer_id, order_id=order_id
+        )
+        return result.get("order", {})
 
     return Agent(
         name="account_agent",
@@ -150,7 +149,7 @@ def build_account_agent(customer_id: str) -> Agent:
 
 
 ### Refund Agent: checks eligibility and processes refunds for the signed-in customer's orders.
-# The eligibility rules live in orders_repo (code), not in the prompt. process_refund re-runs every
+# The eligibility rules live in the orders Lambda (code), not in the prompt. process_refund re-runs every
 # check itself, so a refund can't go through even if the model skips check_refund or is given a wrong order_id.
 def build_refund_agent(customer_id: str) -> Agent:
     system_prompt = f"""You are a Refund agent for the signed-in customer.
@@ -177,7 +176,9 @@ def build_refund_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return []
-        return orders_repo.list_orders(customer_id)
+        return call_orders_lambda("list_orders", customer_id=customer_id).get(
+            "orders", []
+        )
 
     @tool(context=True)
     def check_refund(order_id: str, tool_context: ToolContext) -> dict:
@@ -189,9 +190,9 @@ def build_refund_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return {"eligible": False, "reason": "Customer not identified."}
-        order = orders_repo.get_order(customer_id, order_id)
-        reason = orders_repo.refund_ineligibility_reason(order)
-        return {"eligible": reason is None, "reason": reason, "order": order}
+        return call_orders_lambda(
+            "check_refund", customer_id=customer_id, order_id=order_id
+        )
 
     @tool(context=True)
     def process_refund(order_id: str, reason: str, tool_context: ToolContext) -> dict:
@@ -205,29 +206,10 @@ def build_refund_agent(customer_id: str) -> Agent:
         customer_id = tool_context.agent.state.get("customer_id")
         if not customer_id:
             return {"refunded": False, "reason": "Customer not identified."}
-
-        order = orders_repo.get_order(customer_id, order_id)
-        why_not = orders_repo.refund_ineligibility_reason(order)
-        if why_not is None and not orders_repo.mark_refunded(customer_id, order_id):
-            why_not = "Order status changed before the refund could be processed."  # lost a race
-        if why_not:
-            log.info(f"refund_rejected customer_id={customer_id} order_id={order_id} why={why_not!r}")
-            orders_repo.append_event(
-                customer_id, "refund_rejected", order_id=order_id, reason=reason, rejection=why_not
-            )
-            return {"refunded": False, "reason": why_not}
-
-        log.info(f"refund_processed customer_id={customer_id} order_id={order_id}")
-        orders_repo.append_event(
-            customer_id,
-            "refund_processed",
-            order_id=order_id,
-            item=order["item"],
-            reason=reason,
-            prev_status="delivered",
-            new_status="refunded",
+        # The Lambda re-checks eligibility, does the conditional write and logs the event
+        return call_orders_lambda(
+            "process_refund", customer_id=customer_id, order_id=order_id, reason=reason
         )
-        return {"refunded": True, "order_id": order_id, "item": order["item"]}
 
     return Agent(
         name="refund_agent",
@@ -274,18 +256,25 @@ def build_orchestrator_agent(specialists: list[Agent]) -> Agent:
         tools=specialists,
     )
 
+
 @dataclass(frozen=True)
 class RequestContext:
     """Per-request values that come from the caller, not the model. Tools read these; the model never sees them."""
 
     session_id: str
-    customer_id: str | None = None  # later: taken from the caller's JWT, not the payload
+    customer_id: str | None = (
+        None  # later: taken from the caller's JWT, not the payload
+    )
+
 
 def from_request(payload: dict, context) -> RequestContext:
     customer_id = payload.get("customer_id")
-    if customer_id is not None and (not isinstance(customer_id, str) or not customer_id.strip()):
+    if customer_id is not None and (
+        not isinstance(customer_id, str) or not customer_id.strip()
+    ):
         raise ValueError("customer_id must be a non-empty string")
     return RequestContext(session_id=context.session_id, customer_id=customer_id)
+
 
 ## Run Orchestrator Agent
 @app.entrypoint
