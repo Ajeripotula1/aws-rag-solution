@@ -28,3 +28,4 @@ def _required(name: str) -> str:
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 ORCHESTRATOR_MODEL_ID = _required("ORCHESTRATOR_MODEL_ID")
 WORKER_MODEL_ID = _required("WORKER_MODEL_ID")
+ORDERS_LAMBDA_NAME = _required("ORDERS_LAMBDA_NAME")
